@@ -16,8 +16,19 @@ from pydantic import BaseModel
 from fastembed import TextEmbedding
 
 VECTORS_FILE = Path(__file__).parent / "vectors.json"
+MODEL_PARAMS_FILE = Path(__file__).parent / "model_params.json"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+
+_MP = json.loads(MODEL_PARAMS_FILE.read_text(encoding="utf-8"))
+MODEL_FEATURES = _MP["features"]
+RIDGE_COEF = np.array(_MP["ridge_coef"], dtype=np.float64)
+RIDGE_INTERCEPT = _MP["ridge_intercept"]
+TOWN_BASELINE = _MP["town_baseline"]
+NATIONWIDE_FALLBACK_BASELINE = _MP["nationwide_fallback_baseline"]
+EXISTING_COMBINED_SUM = _MP["existing_combined_score_sum"]
+EXISTING_STORE_COUNT = _MP["existing_store_count"]
+TARGET_REVENUE = {int(k): v for k, v in _MP["target_revenue"].items()}
 
 app = FastAPI(title="711 RAG API")
 
@@ -47,6 +58,20 @@ class AskRequest(BaseModel):
 class ValidateRequest(BaseModel):
     filename: str
     content: str
+
+
+class StoreAllocationRequest(BaseModel):
+    city: str
+    town: str
+    population: float = 0
+    household: float = 0
+    cateringNum: float = 0
+    livingNum: float = 0
+    institutionNum: float = 0
+    transitNum: float = 0
+    competitorNum: float = 0
+    ownStoreNum: float = 0
+    share: int = 62
 
 
 async def call_llm(system_prompt: str, user_prompt: str) -> str:
@@ -198,4 +223,46 @@ async def validate_csv(req: ValidateRequest):
         "status": "needs_attention" if has_issues else "clean",
         "report": report,
         "stats": stats,
+    }
+
+
+@app.post("/api/estimate_allocation")
+async def estimate_allocation(req: StoreAllocationRequest):
+    """把清洗過的新門市特徵套進既有分配模型，估算月營收。
+
+    層一（地區基準）：查表既有 354 個鄉鎮的已算基準值，查不到則退回全國中位數並標記。
+    層二（店級相對分數）：用替代模型（log1p特徵 -> Ridge，對既有7,313家店結果做交叉驗證
+    R²=0.9996）估算，非逐行複製原始 PCA/熵權法程式碼。
+    """
+    if req.share not in TARGET_REVENUE:
+        return {"error": f"share 必須是 60/62/65 其中之一，收到 {req.share}"}
+
+    key = f"{req.city}||{req.town}"
+    town_matched = key in TOWN_BASELINE
+    baseline = TOWN_BASELINE.get(key, NATIONWIDE_FALLBACK_BASELINE)
+
+    x = np.array([getattr(req, f) for f in MODEL_FEATURES], dtype=np.float64)
+    x_log = np.log1p(x)
+    l2_raw = float(x_log @ RIDGE_COEF + RIDGE_INTERCEPT)
+    l2 = min(max(l2_raw, 0.03), 0.97)
+
+    combined = baseline * l2
+    new_total = EXISTING_COMBINED_SUM + combined
+    target = TARGET_REVENUE[req.share]
+    estimated_revenue = combined / new_total * target
+    dilution_pct = (1 - EXISTING_COMBINED_SUM / new_total) * 100
+
+    return {
+        "layer1_regional_baseline": round(baseline, 2),
+        "town_matched_in_existing_data": town_matched,
+        "layer2_relative_score": round(l2, 4),
+        "combined_score": round(combined, 2),
+        "estimated_monthly_revenue": round(estimated_revenue),
+        "existing_store_count": EXISTING_STORE_COUNT,
+        "existing_stores_dilution_pct": round(dilution_pct, 4),
+        "note": (
+            "新增門市會讓所有既有門市的營收被稀釋極小幅度（硬性約束：全體加總=目標總營收），"
+            f"這次新增造成的稀釋幅度約 {round(dilution_pct, 4)}%。"
+            + ("" if town_matched else " 注意：此鄉鎮不在既有354個鄉鎮清單中，地區基準已退回全國中位數估算，準確度較低。")
+        ),
     }
