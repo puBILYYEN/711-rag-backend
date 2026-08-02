@@ -10,8 +10,10 @@ from pathlib import Path
 
 import httpx
 import numpy as np
+import firebase_admin
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from firebase_admin import credentials, firestore
 from pydantic import BaseModel
 from fastembed import TextEmbedding
 
@@ -49,6 +51,46 @@ EMB_NORMS = EMB_MATRIX / np.linalg.norm(EMB_MATRIX, axis=1, keepdims=True)
 print("載入 embedding 模型 (ONNX)...")
 model = TextEmbedding(model_name="BAAI/bge-small-zh-v1.5")
 print(f"RAG API 準備就緒，{len(DOCS)} 個切塊")
+
+_FIREBASE_SA_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+_db = None
+if _FIREBASE_SA_JSON:
+    try:
+        cred = credentials.Certificate(json.loads(_FIREBASE_SA_JSON))
+        firebase_admin.initialize_app(cred)
+        _db = firestore.client()
+        print("Firebase Admin 已連線，AI客服可讀取 raw_imports")
+    except Exception as e:
+        print(f"Firebase Admin 初始化失敗：{e}")
+else:
+    print("未設定 FIREBASE_SERVICE_ACCOUNT_JSON，AI客服無法讀取新上傳資料")
+
+
+def get_recent_imports(limit: int = 20):
+    """讀取最近上傳的 raw_imports，回傳 (document文字, metadata) 清單，格式跟 DOCS/METAS 相容。"""
+    if _db is None:
+        return [], []
+    try:
+        docs = (
+            _db.collection("raw_imports")
+            .order_by("uploadedAt", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+            .stream()
+        )
+        texts, metas = [], []
+        for d in docs:
+            data = d.to_dict()
+            summary = (
+                f"【使用者上傳的原始資料檔案：{data.get('filename', '未知檔名')}】\n"
+                f"AI 品質檢查結果：{data.get('aiReport', '（尚未檢查）')}\n"
+                f"原始內容前段：{str(data.get('content', ''))[:500]}"
+            )
+            texts.append(summary)
+            metas.append({"source": f"新上傳資料：{data.get('filename', d.id)}"})
+        return texts, metas
+    except Exception as e:
+        print(f"讀取 raw_imports 失敗：{e}")
+        return [], []
 
 
 class AskRequest(BaseModel):
@@ -95,11 +137,23 @@ async def call_llm(system_prompt: str, user_prompt: str) -> str:
 
 
 def search(query: str, k: int = 4):
+    import_texts, import_metas = get_recent_imports()
+
+    all_docs = DOCS + import_texts
+    all_metas = METAS + import_metas
+
+    if import_texts:
+        import_embs = np.array([e for e in model.embed(import_texts)], dtype=np.float32)
+        import_norms = import_embs / np.linalg.norm(import_embs, axis=1, keepdims=True)
+        all_norms = np.vstack([EMB_NORMS, import_norms])
+    else:
+        all_norms = EMB_NORMS
+
     q_emb = next(model.embed([query]))
     q_norm = q_emb / np.linalg.norm(q_emb)
-    scores = EMB_NORMS @ q_norm
+    scores = all_norms @ q_norm
     top_idx = np.argsort(-scores)[:k]
-    return [(DOCS[i], METAS[i], float(scores[i])) for i in top_idx]
+    return [(all_docs[i], all_metas[i], float(scores[i])) for i in top_idx]
 
 
 @app.get("/")
