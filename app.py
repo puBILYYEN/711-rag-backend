@@ -33,7 +33,7 @@ EMB_MATRIX = np.array(_data["embeddings"], dtype=np.float32)
 EMB_NORMS = EMB_MATRIX / np.linalg.norm(EMB_MATRIX, axis=1, keepdims=True)
 
 print("載入 embedding 模型 (ONNX)...")
-model = TextEmbedding(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+model = TextEmbedding(model_name="BAAI/bge-small-zh-v1.5")
 print(f"RAG API 準備就緒，{len(DOCS)} 個切塊")
 
 
