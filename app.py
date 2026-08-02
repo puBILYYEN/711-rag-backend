@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
-"""RAG API：接收問題 -> Chroma 檢索相關切塊 -> 呼叫 OpenRouter LLM 生成回答。"""
+"""RAG API（輕量版）：讀取預先算好的向量 JSON -> numpy 算 cosine 相似度 -> 呼叫 OpenRouter LLM 生成回答。
+不依賴 chromadb，避免免費方案記憶體超限。"""
+import json
 import os
 from pathlib import Path
 
-import chromadb
 import httpx
+import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastembed import TextEmbedding
 
-DB_DIR = Path(__file__).parent / "chroma_db"
-COLLECTION_NAME = "711_project_docs"
+VECTORS_FILE = Path(__file__).parent / "vectors.json"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 
@@ -24,20 +25,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+print("載入向量資料...")
+_data = json.loads(VECTORS_FILE.read_text(encoding="utf-8"))
+DOCS = _data["documents"]
+METAS = _data["metadatas"]
+EMB_MATRIX = np.array(_data["embeddings"], dtype=np.float32)
+EMB_NORMS = EMB_MATRIX / np.linalg.norm(EMB_MATRIX, axis=1, keepdims=True)
+
 print("載入 embedding 模型 (ONNX)...")
 model = TextEmbedding(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-client = chromadb.PersistentClient(path=str(DB_DIR))
-collection = client.get_collection(COLLECTION_NAME)
-print("RAG API 準備就緒")
+print(f"RAG API 準備就緒，{len(DOCS)} 個切塊")
 
 
 class AskRequest(BaseModel):
     question: str
 
 
+def search(query: str, k: int = 4):
+    q_emb = next(model.embed([query]))
+    q_norm = q_emb / np.linalg.norm(q_emb)
+    scores = EMB_NORMS @ q_norm
+    top_idx = np.argsort(-scores)[:k]
+    return [(DOCS[i], METAS[i], float(scores[i])) for i in top_idx]
+
+
 @app.get("/")
 def health():
-    return {"status": "ok", "chunks": collection.count()}
+    return {"status": "ok", "chunks": len(DOCS)}
 
 
 @app.post("/api/ask")
@@ -46,15 +60,9 @@ async def ask(req: AskRequest):
     if not question:
         return {"answer": "請輸入問題。", "sources": []}
 
-    query_embedding = [e.tolist() for e in model.embed([question])]
-    results = collection.query(query_embeddings=query_embedding, n_results=4)
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-
-    context = "\n\n".join(
-        f"[來源：{m['source']}]\n{d}" for d, m in zip(docs, metas)
-    )
-    sources = sorted({m["source"] for m in metas})
+    results = search(question)
+    context = "\n\n".join(f"[來源：{m['source']}]\n{d}" for d, m, _ in results)
+    sources = sorted({m["source"] for _, m, _ in results})
 
     if not OPENROUTER_API_KEY:
         return {
