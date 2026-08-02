@@ -8,7 +8,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 DB_DIR = Path(__file__).parent / "chroma_db"
 COLLECTION_NAME = "711_project_docs"
@@ -24,8 +24,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print("載入 embedding 模型...")
-model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+print("載入 embedding 模型 (ONNX)...")
+model = TextEmbedding(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 client = chromadb.PersistentClient(path=str(DB_DIR))
 collection = client.get_collection(COLLECTION_NAME)
 print("RAG API 準備就緒")
@@ -46,7 +46,7 @@ async def ask(req: AskRequest):
     if not question:
         return {"answer": "請輸入問題。", "sources": []}
 
-    query_embedding = model.encode([question]).tolist()
+    query_embedding = [e.tolist() for e in model.embed([question])]
     results = collection.query(query_embeddings=query_embedding, n_results=4)
     docs = results["documents"][0]
     metas = results["metadatas"][0]
