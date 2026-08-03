@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""RAG API（輕量版）：讀取預先算好的向量 JSON -> numpy 算 cosine 相似度 -> 呼叫 OpenRouter LLM 生成回答。
+"""RAG API（輕量版）：讀取預先算好的向量 JSON -> numpy 算 cosine 相似度 -> 呼叫 Groq LLM 生成回答。
 不依賴 chromadb，避免免費方案記憶體超限。"""
 import csv
 import io
@@ -19,8 +19,8 @@ from fastembed import TextEmbedding
 
 VECTORS_FILE = Path(__file__).parent / "vectors.json"
 MODEL_PARAMS_FILE = Path(__file__).parent / "model_params.json"
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 _MP = json.loads(MODEL_PARAMS_FILE.read_text(encoding="utf-8"))
 MODEL_FEATURES = _MP["features"]
@@ -117,14 +117,14 @@ class StoreAllocationRequest(BaseModel):
 
 
 async def call_llm(system_prompt: str, user_prompt: str) -> str:
-    if not OPENROUTER_API_KEY:
-        return "（後端尚未設定 OPENROUTER_API_KEY，無法生成報告）"
+    if not GROQ_API_KEY:
+        return "（後端尚未設定 GROQ_API_KEY，無法生成報告）"
     async with httpx.AsyncClient(timeout=30) as http_client:
         resp = await http_client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             json={
-                "model": OPENROUTER_MODEL,
+                "model": GROQ_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -171,9 +171,9 @@ async def ask(req: AskRequest):
     context = "\n\n".join(f"[來源：{m['source']}]\n{d}" for d, m, _ in results)
     sources = sorted({m["source"] for _, m, _ in results})
 
-    if not OPENROUTER_API_KEY:
+    if not GROQ_API_KEY:
         return {
-            "answer": "（後端尚未設定 OPENROUTER_API_KEY，先回傳檢索到的原始片段）\n\n" + context[:800],
+            "answer": "（後端尚未設定 GROQ_API_KEY，先回傳檢索到的原始片段）\n\n" + context[:800],
             "sources": sources,
         }
 
